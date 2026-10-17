@@ -8,8 +8,8 @@ provider, refuses the set if the providers disagree beyond the agreed
 tolerance, and pays out at the middle average. Unverifiable or over budget —
 the whole escrow goes home.
 
-Deployed on GenLayer Bradbury: **`0x45BC0DECFD77781bAE4Bd1Eab1D4aB63f2022D85`**
-([explorer](https://explorer-bradbury.genlayer.com/address/0x45BC0DECFD77781bAE4Bd1Eab1D4aB63f2022D85))
+Deployed on GenLayer Bradbury: **`0x54fAFA5377f0c5a4C306eDf0A19eeB6dd5e54e2B`**
+([explorer](https://explorer-bradbury.genlayer.com/address/0x54fAFA5377f0c5a4C306eDf0A19eeB6dd5e54e2B))
 
 ---
 
@@ -109,5 +109,5 @@ python -m pytest tests/direct -q        # 40 passed
 ## Source integrity
 
 ```
-sha256  bdb3502de37f5c4f445efb2ab59eb6ee0dec54cfb864ba4e783a96267e3deb0a
+sha256  bc5f35f5182bff56fc8839f963cf045cf3c8038479f11472b2aa4ab23b64c68c
 ```

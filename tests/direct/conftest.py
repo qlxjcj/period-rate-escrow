@@ -100,7 +100,7 @@ def remock(vm, fr=None, ca=None, ec=None, us=None, model=None):
         vm.mock_web(".*EXR/D\\.USD\\.EUR.*", {"method": "GET", "status": 200, "body": us})
     if model is not None:
         # The pattern must cross newlines: '.' does not match '\n'.
-        vm.mock_llm(r"[\s\S]*USD/CNY[\s\S]*", model)
+        vm.mock_llm(r"[\s\S]*Currency data from several sources[\s\S]*", model)
 
 
 def happy(vm, same="true"):

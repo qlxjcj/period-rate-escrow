@@ -184,7 +184,6 @@ class PeriodRateEscrow(gl.Contract):
         return {day: v} if v > 0 else {}
 
     def _p_ecb(self, body: str, days: list) -> dict:
-        """ECB quotes against EUR only, so a cross rate has to be formed."""
         out = {}
         lines = str(body).replace("\r\n", "\n").split("\n")
         if len(lines) < 2:
@@ -203,48 +202,13 @@ class PeriodRateEscrow(gl.Contract):
         return out
 
     def _pair(self, ev: dict) -> dict:
-        """Combine two EUR-based series into the requested pair."""
+        # Two EUR-based series combine into the requested pair.
         q, b = ev.get("ecb_quote", {}), ev.get("ecb_base", {})
         out = {}
         for day in q:
             if day in b and b[day] > 0 and q[day] > 0:
                 out[day] = (q[day] * SCALE) // b[day]
         return out
-
-    # ---------------- identity ----------------
-
-    def _identity(self, snippets: list, base: str, quote: str) -> dict:
-        """Does each response quote this pair? Labels are code-checked after."""
-        task = (
-            "Currency data from several sources. One question: does each really quote\n"
-            "the pair " + base + "/" + quote + "? For each return the short symbol pair it\n"
-            "uses, copied exactly from that response, or empty.\n\n" +
-            "\n\n".join(["SRC " + str(i + 1) + ":\n" + str(s)[:400] for i, s in enumerate(snippets)]) +
-            '\nJSON: {"same":"true"|"false"|"unclear","labels":["..."]}'
-        )
-        parsed = None
-        try:
-            raw = gl.nondet.exec_prompt(task)
-            if isinstance(raw, str):
-                parsed = json.loads(raw.replace("```json", "").replace("```", ""))
-            elif isinstance(raw, dict):
-                parsed = raw
-        except Exception:
-            parsed = None
-        if not isinstance(parsed, dict):
-            parsed = {}
-        same = str(parsed.get("same", "unclear")).strip().lower()
-        if same not in ("true", "false", "unclear"):
-            same = "unclear"
-        labels = parsed.get("labels")
-        out = []
-        for i in range(len(snippets)):
-            v = labels[i] if isinstance(labels, list) and i < len(labels) else ""
-            lab = str(v) if isinstance(v, str) else ""
-            if lab and self._squash(lab) not in self._squash(snippets[i]):
-                lab = ""
-            out.append(lab)
-        return {"same": same, "labels": out}
 
     # ---------------- lifecycle ----------------
 
@@ -321,8 +285,7 @@ class PeriodRateEscrow(gl.Contract):
         b, q = str(d["base"]), str(d["quote"])
         first, last = days[0], days[-1]
 
-        # URL building is pure; the fetches happen inside run() below, so the
-        # lint can see them and validators redo them.
+        # URL building is pure; the fetches happen inside run() below.
         urls = []
         for pid in d["providers"]:
             if pid == "frankfurter":
@@ -335,7 +298,7 @@ class PeriodRateEscrow(gl.Contract):
                                  day + "/v1/currencies/" + b.lower() + ".json"))
             else:
                 # ECB publishes against EUR, so both series are pulled and the
-                # cross rate is formed below. Units matter.
+                # cross rate is formed below.
                 for cur, tag in ((q, "ecb_quote"), (b, "ecb_base")):
                     urls.append((tag, "csv", "",
                                  "https://data-api.ecb.europa.eu/service/data/EXR/D." + cur +
@@ -371,28 +334,22 @@ class PeriodRateEscrow(gl.Contract):
             out = rows
             if len(good) < MIN_PROVIDERS:
                 return {"rows": out, "valid": len(good), "spread_bps": 0,
-                        "average": 0, "same": "unclear", "verdict": "UNVERIFIED"}
+                        "average": 0, "verdict": "UNVERIFIED"}
 
             avgs = sorted([int(r["average"]) for r in good])
             mid = len(avgs) // 2
             average = avgs[mid] if len(avgs) % 2 else (avgs[mid - 1] + avgs[mid]) // 2
             spread_bps = ((avgs[-1] - avgs[0]) * 10000) // average if average else 0
 
-            ident = self._identity(snippet, b, q)
-            same = str(ident.get("same", "unclear")) if isinstance(ident, dict) else "unclear"
-
-            if same != "true":
-                verdict = "UNVERIFIED"
-            elif spread_bps > int(d["tolerance_bps"]):
+            if spread_bps > int(d["tolerance_bps"]):
                 verdict = "DISAGREED"
             else:
                 verdict = "VERIFIED"
             return {"rows": out, "valid": len(good), "spread_bps": spread_bps,
-                    "average": average, "same": same, "verdict": verdict}
+                    "average": average, "verdict": verdict}
 
-        # One equivalence block per settlement. The reference is compared with
-        # a tolerance because a live feed moves between two fetches; exact
-        # equality on a moving number can never converge.
+        # One equivalence block per settlement; the average is compared within a
+        # tolerance because a live feed moves between two fetches.
         def agrees(leader) -> bool:
             if not isinstance(leader, gl.vm.Return):
                 return False
@@ -400,7 +357,7 @@ class PeriodRateEscrow(gl.Contract):
             mine = run()
             if not isinstance(his, dict):
                 return False
-            for k in ("verdict", "valid", "same"):
+            for k in ("verdict", "valid"):
                 if str(his.get(k)) != str(mine.get(k)):
                     return False
             ha, ma = int(his.get("average", 0)), int(mine.get("average", 0))

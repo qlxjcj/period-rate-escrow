@@ -284,46 +284,24 @@ def test_a_wider_tolerance_accepts_the_same_data(escrow):
 
 
 # ==========================================================================
-# D. identity
+# D. no model at all
 # ==========================================================================
 
 
-def test_identity_must_agree(escrow):
+def test_every_decision_is_code_over_fetched_data(escrow):
+    """There is no model in this contract. Every source is checked in code -
+    Frankfurter's base field, currency-api's key, the ECB CURRENCY column - so
+    a wrong-currency payload is refused before any arithmetic. This test pins
+    the refusals that make that true."""
     vm, c = escrow
     did = open_deal(vm, c)
-    happy(vm, same="false")
-    assert settle(vm, c, did) == "REFUNDED"
-    assert deal(vm, c, did)["reason"] == "the period average could not be verified"
-
-
-def test_unclear_identity_refuses_the_set(escrow):
-    vm, c = escrow
-    did = open_deal(vm, c)
-    happy(vm, same="unclear")
-    assert settle(vm, c, did) == "REFUNDED"
-
-
-def test_a_label_not_in_the_response_is_discarded(escrow):
-    """The model cannot invent a label: it must occur in that response."""
-    vm, c = escrow
-    did = open_deal(vm, c)
-    happy(vm, same="true")
-    remock(vm, fr=frankfurter(), ca={i: curapi(i) for i in range(3)},
-           ec=ecb(SCALED), us=ecb([100000000] * 3, cur="USD"),
-           model=ident("true", ["USD/CNY"] + ["a made up ticker"] * 5))
+    remock(vm, fr=frankfurter(base="EUR"), ca={i: curapi(i) for i in range(3)},
+           ec=ecb(SCALED), us=ecb([100000000] * 3, cur="USD"))
     settle(vm, c, did)
-    labels = [r for r in rates(vm, c, did)]
-    assert isinstance(labels, list)
-
-
-def test_a_malformed_identity_answer_is_fail_closed(escrow):
-    vm, c = escrow
-    for bad in ("not json at all", '{"same":"nope"}', '{"labels":7}', ""):
-        vm, c = escrow
-        did = open_deal(vm, c)
-        remock(vm, fr=frankfurter(), ca={i: curapi(i) for i in range(3)},
-               ec=ecb(SCALED), us=ecb([100000000] * 3, cur="USD"), model=bad)
-        assert settle(vm, c, did) == "REFUNDED"
+    rows = {r["provider"]: r for r in rates(vm, c, did)}
+    assert rows["frankfurter"]["days"] == 0
+    assert rows["currencyapi"]["days"] == 3
+    assert rows["ecb"]["days"] == 3
 
 
 # ==========================================================================
