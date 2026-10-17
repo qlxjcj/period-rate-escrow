@@ -1,0 +1,113 @@
+# Period Rate Escrow
+
+**Escrow that settles at the average exchange rate over a closed window.**
+
+Two parties agree a short run of calendar days and a notional. At settlement
+the contract pulls each provider's rates for that window, averages them per
+provider, refuses the set if the providers disagree beyond the agreed
+tolerance, and pays out at the middle average. Unverifiable or over budget —
+the whole escrow goes home.
+
+Deployed on GenLayer Bradbury: **`0x45BC0DECFD77781bAE4Bd1Eab1D4aB63f2022D85`**
+([explorer](https://explorer-bradbury.genlayer.com/address/0x45BC0DECFD77781bAE4Bd1Eab1D4aB63f2022D85))
+
+---
+
+## Why the window is the whole design
+
+An average over a period **cannot exist until the period is over**. So the
+contract refuses to settle before the last window day has ended: the evidence
+set is final because time made it final, not because a policy note said so.
+
+That is the fix for the most common failure in this class of contract —
+deciding while the evidence set can still grow. Here it is impossible.
+
+## Real providers, real units
+
+Three venues, three shapes, **two different unit conventions**:
+
+| provider | shape | currency id | unit |
+|---|---|---|---|
+| Frankfurter | nested JSON keyed by date | `CNY` | requested base |
+| currency-api | flat JSON keyed by code | `cny` | file's base |
+| ECB SDW | **CSV** | `CURRENCY=CNY` | **quoted against EUR** |
+
+ECB only publishes against EUR, so a USD→CNY rate has to be **formed as a cross
+rate** from two series. Forgetting that would silently pay at the wrong rate —
+which is exactly the class of bug the "units must be right" rule exists for.
+
+Nothing is accepted for being non-empty. A payload must parse in its own
+format, name the requested currency, cover the window days, and carry a
+positive rate. A 500 page, a CSV missing `TIME_PERIOD`, a quote for another
+base — all refused, with a recorded reason.
+
+**No floats touch a rate.** Decimals become integers at `1e8` scale by string
+arithmetic, because a float in that path rounds differently across validators
+and silently breaks consensus on the stored value.
+
+## What the model does
+
+One narrow question: *does each response really quote this pair?* The model
+returns the symbol pair each source uses and **code then checks it literally
+occurs in that response**. A model can only lose credit, never create it.
+`unclear` is not a yes.
+
+## Consensus
+
+Fetching, parsing and the model call share **one equivalence-principle block**
+(`run_nondet_unsafe`), so a settlement has a single consensus point. Decision
+fields — `verdict`, `valid`, `same`, which sources covered the window — are
+compared **exactly**; the period average is compared **within a tolerance**,
+because a live feed moves between two fetches and exact equality on a moving
+number can never converge.
+
+## Money
+
+`cost = notional * average / 1e8`. Then:
+
+| outcome | seller | buyer |
+|---|---|---|
+| verified, cost fits | `cost` | `escrow - cost` (the change) |
+| providers disagree, or unverifiable | — | the whole escrow |
+| escrow does not cover the cost | — | the whole escrow |
+| cancelled before the window opens | — | the whole escrow |
+| deadline passes with no settlement | — | the whole escrow |
+
+`seller_paid + buyer_refund == escrow` on every path.
+
+## App
+
+`index.html` is a working app: open a settlement, browse them, inspect one and
+settle, cancel or expire it. Every read is bound to a settlement id — there is
+no `get_latest()` anywhere. Wallet writes go through the injected provider,
+with loading states and surfaced errors. DOM APIs only.
+
+## API
+
+| method | note |
+|---|---|
+| `open_settlement(seller, base, quote, days, notional, tolerance_bps, providers, settle_after, deadline)` | **payable**. `days` are `YYYY-MM-DD`, all already past |
+| `settle(deal_id)` | averages each provider over the closed window and pays |
+| `cancel(deal_id)` | buyer only, before the settle window opens |
+| `expire(deal_id)` | anyone, after the deadline |
+| `get_settlement` / `get_rates` / `get_deal_count` | JSON strings and plain ints |
+
+**Bounds** — 1..5 window days, 2..3 providers, tolerance 0..5000 bps.
+
+## Testing
+
+40 direct-mode tests in `tests/direct/test_period_rate_escrow.py`, in eight
+groups: deal creation, provider adapters, cross-validation, identity, funds,
+exits, write preconditions, views. The payloads in `conftest.py` are the real
+shapes captured from the three venues. Two accounting hooks make every payout
+assertion a real balance change. There is deliberately no catch-all model mock.
+
+```
+python -m pytest tests/direct -q        # 40 passed
+```
+
+## Source integrity
+
+```
+sha256  bdb3502de37f5c4f445efb2ab59eb6ee0dec54cfb864ba4e783a96267e3deb0a
+```
