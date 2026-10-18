@@ -45,21 +45,25 @@ base — all refused, with a recorded reason.
 arithmetic, because a float in that path rounds differently across validators
 and silently breaks consensus on the stored value.
 
-## What the model does
+## No model decides anything
 
-One narrow question: *does each response really quote this pair?* The model
-returns the symbol pair each source uses and **code then checks it literally
-occurs in that response**. A model can only lose credit, never create it.
-`unclear` is not a yes.
+There is **no model in this contract**. Every source is verified in code for the
+currency it names — Frankfurter's `base` field, currency-api's key, the ECB's
+`CURRENCY` column — so a wrong-currency payload is refused before any arithmetic.
+
+An earlier revision asked a model to confirm the pair. On live data that gate
+refused a correct settlement: the ECB quotes `CNY/EUR`, so a model answering
+"this does not quote USD/CNY" was **right**, and the escrow refunded. The
+question had a deterministic answer that code already had. The gate was removed.
 
 ## Consensus
 
-Fetching, parsing and the model call share **one equivalence-principle block**
+Fetching and parsing share **one equivalence-principle block**
 (`run_nondet_unsafe`), so a settlement has a single consensus point. Decision
-fields — `verdict`, `valid`, `same`, which sources covered the window — are
-compared **exactly**; the period average is compared **within a tolerance**,
-because a live feed moves between two fetches and exact equality on a moving
-number can never converge.
+fields — `verdict`, `valid`, which sources covered the window — are compared
+**exactly**; the period average is compared **within a tolerance**, because a
+live feed moves between two fetches and exact equality on a moving number can
+never converge.
 
 ## Money
 
@@ -96,14 +100,15 @@ with loading states and surfaced errors. DOM APIs only.
 
 ## Testing
 
-40 direct-mode tests in `tests/direct/test_period_rate_escrow.py`, in eight
-groups: deal creation, provider adapters, cross-validation, identity, funds,
-exits, write preconditions, views. The payloads in `conftest.py` are the real
+37 direct-mode tests in `tests/direct/test_period_rate_escrow.py`, in eight
+groups: deal creation, provider adapters, cross-validation, the no-model
+refusals, funds, exits, write preconditions, views. The payloads in
+`conftest.py` are the real
 shapes captured from the three venues. Two accounting hooks make every payout
 assertion a real balance change. There is deliberately no catch-all model mock.
 
 ```
-python -m pytest tests/direct -q        # 40 passed
+python -m pytest tests/direct -q        # 37 passed
 ```
 
 ## Source integrity
