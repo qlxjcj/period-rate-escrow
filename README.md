@@ -1,6 +1,7 @@
-# Period Rate Escrow
+# FixSpan Escrow
 
-**Escrow that settles at the average exchange rate over a closed window.**
+**Settle at the average exchange rate over a closed window — a rate that does
+not exist until the window is over.**
 
 Two parties agree a short run of calendar days and a notional. At settlement
 the contract pulls each provider's rates for that window, averages them per
