@@ -42,7 +42,7 @@
   .mono { font-family:"SF Mono",Consolas,monospace; font-size:12.5px; word-break:break-all; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   #toast { position:fixed; right:18px; bottom:18px; display:flex; flex-direction:column;
-           gap:9px; z-index:50; max-width:340px; }
+           gap:9px; z-index:50; max-width:360px; }
   .msg { padding:11px 14px; border-radius:8px; border:1px solid var(--line);
          background:var(--panel); font-size:13.5px; }
   .msg.error { border-color:var(--bad); } .msg.success { border-color:var(--ok); }
@@ -51,6 +51,8 @@
              vertical-align:-2px; margin-right:7px; }
   @keyframes spin { to { transform:rotate(360deg); } }
   .hint { font-size:12.5px; color:var(--dim); margin-top:8px; }
+  .preview { font-size:13px; color:var(--dim); margin-top:10px; }
+  .preview b { color:var(--ink); font-weight:600; }
   a { color:var(--acc); }
 </style>
 </head>
@@ -80,8 +82,9 @@
     <div class="grid">
       <div><label>Base currency</label><select id="f_base"></select></div>
       <div><label>Quote currency</label><select id="f_quote"></select></div>
-      <div><label>Notional (base units)</label><input id="f_notional" value="100"></div>
-      <div><label>Escrow (quote units)</label><input id="f_escrow" value="700"></div>
+      <div><label>Notional (GEN)</label><input id="f_notional" value="100"></div>
+      <div><label>Escrow (GEN)</label><input id="f_escrow" value="700"></div>
+      <div><label>Strike rate (quote per base)</label><input id="f_strike" value="6.72"></div>
       <div><label>Max provider spread (bps)</label><input id="f_tol" value="500"></div>
       <div><label>Seller address</label><input id="f_seller" placeholder="0x…"></div>
     </div>
@@ -92,10 +95,12 @@
       <div><label>Deadline (s from now)</label><input id="f_deadline" value="86400"></div>
     </div>
     <div style="margin-top:14px"><label>Providers</label><div id="f_providers" class="row"></div></div>
-    <div class="row" style="margin-top:18px">
+    <p class="preview" id="preview"></p>
+    <div class="row" style="margin-top:14px">
       <button class="primary" id="createBtn">Open settlement</button>
-      <span class="hint">Rates are compared at 1e8 scale. The escrow is released only when the
-        providers' period averages agree and the cost fits.</span>
+      <span class="hint">Amounts are GEN in wei (18 decimals). Rates are quote per base at
+        8 decimals. Payout = notional × period average ÷ strike, so the escrow is released only
+        when every valid source covers the whole window and their averages agree.</span>
     </div>
   </div>
 </section>
@@ -129,10 +134,12 @@
 
 <script type="module">
 import { createClient } from "https://cdn.jsdelivr.net/npm/genlayer-js@1.2.0/+esm";
+import {
+  coverage, formatAmount, formatRate, payoutWei, toRate, toWei,
+} from "./units.mjs";
 
-const CONTRACT = "0x54fAFA5377f0c5a4C306eDf0A19eeB6dd5e54e2B";
+const CONTRACT = "0xeb7657fe706C9e699fFaab4E71F63786234a9Fdf";
 const RPC = "https://rpc-bradbury.genlayer.com";
-const SCALE = 100000000n;
 const BASES = ["USD", "EUR", "GBP", "JPY"];
 const QUOTES = ["CNY", "USD", "EUR", "JPY"];
 const PROVIDERS = ["frankfurter", "ecb", "currencyapi"];
@@ -169,9 +176,10 @@ function busy(btn, on, label) {
   } else if (btn.dataset.label) btn.textContent = btn.dataset.label;
 }
 function pill(s) { return el("span", "pill p-" + s, s); }
-function num(v, dp) {
-  return (Number(v) / 100).toLocaleString(undefined, { maximumFractionDigits: dp === undefined ? 4 : dp });
-}
+
+/** GEN text -> wei, rate text -> 1e8 integer. Both come from units.mjs. */
+function amount(text) { return toWei(text).toString(); }
+function rate(text) { return toRate(text).toString(); }
 
 async function read(method, args) {
   return await readClient.readContract({ address: CONTRACT, functionName: method, args });
@@ -193,15 +201,6 @@ async function write(method, args, value) {
   });
 }
 
-function toScaled(text) {
-  const s = String(text).trim();
-  if (!/^-?\d+(\.\d+)?$/.test(s)) throw new Error("Not a number: " + text);
-  const neg = s.startsWith("-");
-  const [whole, frac = ""] = (neg ? s.slice(1) : s).split(".");
-  const v = BigInt(whole || "0") * SCALE + BigInt((frac + "0000000000").slice(0, 10));
-  return neg ? -v : v;
-}
-
 function fillSelects() {
   for (const [id, list] of [["f_base", BASES], ["f_quote", QUOTES]]) {
     const s = $(id); s.textContent = "";
@@ -219,6 +218,27 @@ function fillSelects() {
   }
 }
 
+function preview() {
+  const p = $("preview");
+  try {
+    const notional = toWei($("f_notional").value);
+    const escrow = toWei($("f_escrow").value);
+    const strike = toRate($("f_strike").value);
+    // At the strike the payout is exactly the notional; above it the ratio grows.
+    const atStrike = payoutWei(notional, strike, strike);
+    p.textContent = "";
+    p.appendChild(el("span", "", "At the strike the payout is "));
+    p.appendChild(el("b", "", formatAmount(atStrike) + " GEN"));
+    p.appendChild(el("span", "", " out of " + formatAmount(escrow) + " GEN escrow; "
+      + "payout = notional × average ÷ strike. The strike must be entered at 1e8, e.g. 6.72 → "
+      + rate($("f_strike").value) + "."));
+    p.className = "preview";
+  } catch (e) {
+    p.textContent = String(e.message || e);
+    p.className = "preview bad";
+  }
+}
+
 async function loadList() {
   const body = $("listBody");
   body.textContent = "";
@@ -227,7 +247,8 @@ async function loadList() {
     if (count === 0) { body.appendChild(el("p", "dim", "No settlements yet.")); return; }
     const table = el("table", "", "");
     const head = el("tr", "", "");
-    for (const h of ["id", "pair", "window", "notional", "status", "average"]) head.appendChild(el("th", "", h));
+    for (const h of ["id", "pair", "window", "notional (GEN)", "status", "average"])
+      head.appendChild(el("th", "", h));
     table.appendChild(head);
     for (let i = 0; i < count; i++) {
       // Bound to the id. There is no get_latest anywhere in this app.
@@ -237,9 +258,9 @@ async function loadList() {
       tr.appendChild(el("td", "mono", d.deal_id));
       tr.appendChild(el("td", "", d.base + "/" + d.quote));
       tr.appendChild(el("td", "dim", d.days[0] + " → " + d.days[d.days.length - 1]));
-      tr.appendChild(el("td", "", num(d.notional)));
+      tr.appendChild(el("td", "", formatAmount(d.notional)));
       const st = el("td", "", ""); st.appendChild(pill(d.status)); tr.appendChild(st);
-      tr.appendChild(el("td", "", d.average ? (Number(d.average) / 1e8).toFixed(4) : "—"));
+      tr.appendChild(el("td", "", d.average ? formatRate(d.average) : "—"));
       tr.onclick = () => openDetail(d.deal_id);
       table.appendChild(tr);
     }
@@ -269,7 +290,7 @@ async function openDetail(dealId) {
       td.textContent = v;
       tr.appendChild(td); meta.appendChild(tr);
     };
-    const st = el("tr", "", "");
+    const st = el("tr", "");
     st.appendChild(el("th", "", "status"));
     const c = el("td", "", ""); c.appendChild(pill(d.status));
     c.appendChild(document.createTextNode("  " + d.reason));
@@ -277,35 +298,43 @@ async function openDetail(dealId) {
     add("buyer", d.buyer); add("seller", d.seller);
     add("pair", d.base + " → " + d.quote);
     add("window", d.days.join(", "));
-    add("notional", num(d.notional) + " " + d.base);
-    add("escrow", num(d.escrow) + " " + d.quote);
-    add("period average", d.average ? (Number(d.average) / 1e8).toFixed(6) : "—");
+    add("notional", formatAmount(d.notional) + " GEN");
+    add("escrow", formatAmount(d.escrow) + " GEN");
+    add("strike", formatRate(d.strike) + " " + d.quote + "/" + d.base);
+    add("period average", d.average ? formatRate(d.average) + " " + d.quote + "/" + d.base : "—");
     add("observed spread", d.spread_bps + " bps");
-    add("seller paid", num(d.seller_paid) + " " + d.quote);
-    add("buyer refunded", num(d.buyer_refund) + " " + d.quote);
+    add("valid sources", d.valid_count + " of " + d.providers.length + " (exact window only)");
+    add("payout", d.payout ? formatAmount(d.payout) + " GEN" : "—");
+    add("seller paid", formatAmount(d.seller_paid) + " GEN");
+    add("buyer refunded", formatAmount(d.buyer_refund) + " GEN");
+    add("units", d.units.asset + " · amounts " + d.units.amount_decimals + " dp · rates "
+      + d.units.rate_decimals + " dp · " + d.units.rate);
     body.appendChild(meta);
 
     if (rows.length) {
       body.appendChild(el("h2", "", "What each source produced"));
       const q = el("table", "", "");
       const head = el("tr", "", "");
-      for (const h of ["source", "days found", "period average"]) head.appendChild(el("th", "", h));
+      for (const h of ["source", "coverage", "period average"]) head.appendChild(el("th", "", h));
       q.appendChild(head);
       for (const r of rows) {
         const tr = el("tr", "", "");
         tr.appendChild(el("td", "", r.provider));
-        tr.appendChild(el("td", r.days > 0 ? "ok" : "bad", r.days));
-        tr.appendChild(el("td", "", r.average ? (Number(r.average) / 1e8).toFixed(6) : "—"));
+        tr.appendChild(el("td", r.covered ? "ok" : "bad", coverage(r.days, d.days.length)));
+        tr.appendChild(el("td", "", r.average ? formatRate(r.average) : "—"));
         q.appendChild(tr);
       }
       body.appendChild(q);
+      body.appendChild(el("p", "hint",
+        "A source counts only when it covers all " + d.days.length +
+        " requested days: a 2-of-3 average is not the period average."));
     }
 
     $("detailHint").textContent = d.status === "OPEN"
       ? "Settle is possible inside [" + new Date(d.settle_after * 1000).toISOString() +
         ", " + new Date(d.deadline * 1000).toISOString() + "]. Cancel is buyer-only before it " +
         "opens; expire is permissionless after the deadline."
-      : "Final. seller_paid + buyer_refund = escrow.";
+      : "Final. seller_paid + buyer_refund = escrow, in GEN.";
   } catch (e) {
     body.textContent = "";
     body.appendChild(el("p", "bad", "Could not read this settlement: " + String(e).slice(0, 160)));
@@ -320,11 +349,12 @@ async function doCreate() {
     const days = $("f_days").value.split(",").map((x) => x.trim()).filter(Boolean);
     const args = [
       $("f_seller").value.trim(), $("f_base").value, $("f_quote").value, days,
-      toScaled($("f_notional").value).toString(),
+      amount($("f_notional").value),
+      rate($("f_strike").value),
       $("f_tol").value.trim(), providers,
       $("f_after").value.trim(), $("f_deadline").value.trim(),
     ];
-    await write("open_settlement", args, toScaled($("f_escrow").value));
+    await write("open_settlement", args, toWei($("f_escrow").value));
     toast("Settlement opened. It appears in the list once the transaction lands.", "success");
     showList();
   } catch (e) {
@@ -371,7 +401,10 @@ $("connectBtn").onclick = async () => {
   finally { busy(btn, false); }
 };
 
+for (const id of ["f_notional", "f_escrow", "f_strike"]) $(id).addEventListener("input", preview);
+
 fillSelects();
+preview();
 showNew();
 </script>
 </body>

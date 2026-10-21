@@ -2,22 +2,21 @@
 import json
 from genlayer import *
 
-SCALE = 100000000
-MAX_DAYS = 5
-MIN_PROVIDERS = 2
-MAX_TOL = 5000
-REF_TOL = 200
+# ---------------- the unit model ----------------
+# AMOUNT: the escrowed native asset (GEN), integer wei, 10**18.
+# RATE:   quote per base, integer at 10**8.
+# The rate is only ever a ratio: payout_wei = notional_wei * average // strike.
+# Both rates are quote per base, so the ratio is dimensionless and the payout
+# stays in wei. The contract never converts GEN into a currency.
+
+RATE_SCALE = 10 ** 8
+AGREE_MIN = 10              # validator agreement floor, bps (feed jitter)
+AGREE_MAX = 250             # validator agreement cap, bps
 
 OPEN = "OPEN"
 EXECUTED = "EXECUTED"
 REFUNDED = "REFUNDED"
 CANCELLED = "CANCELLED"
-
-PROVIDERS = ["frankfurter", "ecb", "currencyapi"]
-# Each venue names a currency its own way.
-SYMBOLS = {"frankfurter": 0, "ecb": 1, "currencyapi": 2}
-
-SPACE = " \t\r\n\f\v"
 
 
 class PeriodRateEscrow(gl.Contract):
@@ -41,15 +40,6 @@ class PeriodRateEscrow(gl.Contract):
         if isinstance(a, (bytes, bytearray)):
             return "0x" + bytes(a).hex()
         return str(a)
-
-    def _is_valid_address(self, addr) -> bool:
-        if not isinstance(addr, str) or not addr.startswith("0x") or len(addr) != 42:
-            return False
-        try:
-            int(addr[2:], 16)
-        except ValueError:
-            return False
-        return True
 
     def _iso_to_epoch(self, s: str) -> int:
         s = s.strip()
@@ -92,16 +82,9 @@ class PeriodRateEscrow(gl.Contract):
             return 0
         return self._iso_to_epoch(d if isinstance(d, str) else str(d))
 
-    def _squash(self, text: str) -> str:
-        out = []
-        for ch in str(text).lower():
-            if ch in SPACE:
-                continue
-            out.append(ch)
-        return "".join(out)
-
     def _dec(self, text) -> int:
-        """Decimal literal -> integer at SCALE. String arithmetic only: floats round differently across validators."""
+        """Decimal literal -> integer at RATE_SCALE. String arithmetic only:
+        floats round differently on different validators."""
         s = str(text).strip()
         if not s or "e" in s or "E" in s:
             return 0
@@ -118,7 +101,7 @@ class PeriodRateEscrow(gl.Contract):
             return 0
         if whole == "":
             whole = "0"
-        v = int(whole) * SCALE + int((frac + "00000000")[:8])
+        v = int(whole) * RATE_SCALE + int((frac + "00000000")[:8])
         return -v if neg else v
 
     def _body(self, content) -> str:
@@ -140,8 +123,61 @@ class PeriodRateEscrow(gl.Contract):
     def _save(self, d: dict):
         self.deals[d["deal_id"]] = json.dumps(d)
 
-    def _day_end(self, day: str) -> int:
-        return self._iso_to_epoch(str(day) + "T23:59:59+00:00")
+    def _payout(self, notional: int, average: int, strike: int) -> int:
+        if strike <= 0 or average <= 0:
+            return 0
+        return (notional * average) // strike
+
+    def _agree_tol(self, tolerance_bps: int) -> int:
+        # Deal-appropriate: the deal's own tolerance, floored for feed jitter,
+        # capped so a loose deal cannot wave through a different payout.
+        t = int(tolerance_bps)
+        if t < AGREE_MIN:
+            t = AGREE_MIN
+        if t > AGREE_MAX:
+            t = AGREE_MAX
+        return t
+
+    def _agree(self, his, mine, tol: int, providers: int) -> bool:
+        # Every payout-determining number is bound: verdict, valid count, the
+        # per-provider coverage and average, the spread, the average, the payout.
+        if not isinstance(his, dict) or not isinstance(mine, dict):
+            return False
+        if str(his.get("verdict", "")) != str(mine.get("verdict", "")):
+            return False
+        if str(his.get("valid", "")) != str(mine.get("valid", "")):
+            return False
+        hs, ms = int(his.get("spread_bps", 0)), int(mine.get("spread_bps", 0))
+        if hs < 0 or ms < 0 or abs(hs - ms) > tol:
+            return False
+        for k in ("average", "payout"):
+            h, m = int(his.get(k, 0)), int(mine.get(k, 0))
+            if h <= 0 or m <= 0:
+                if h != m:
+                    return False
+            elif abs(h - m) * 10000 > h * tol:
+                return False
+        hr, mr = his.get("rows"), mine.get("rows")
+        if not isinstance(hr, list) or not isinstance(mr, list):
+            return False
+        if len(hr) != providers or len(mr) != providers:
+            return False
+        for x, y in zip(hr, mr):
+            if not isinstance(x, dict) or not isinstance(y, dict):
+                return False
+            if str(x.get("provider")) != str(y.get("provider")):
+                return False
+            if str(x.get("days")) != str(y.get("days")):
+                return False
+            if bool(x.get("covered")) != bool(y.get("covered")):
+                return False
+            h, m = int(x.get("average", 0)), int(y.get("average", 0))
+            if h <= 0 or m <= 0:
+                if h != m:
+                    return False
+            elif abs(h - m) * 10000 > h * tol:
+                return False
+        return True
 
     # ---------------- provider adapters ----------------
     # Parsing is pure. Every fetch happens inside the single equivalence block
@@ -207,72 +243,86 @@ class PeriodRateEscrow(gl.Contract):
         out = {}
         for day in q:
             if day in b and b[day] > 0 and q[day] > 0:
-                out[day] = (q[day] * SCALE) // b[day]
+                out[day] = (q[day] * RATE_SCALE) // b[day]
         return out
 
     # ---------------- lifecycle ----------------
 
     @gl.public.write.payable
     def open_settlement(self, seller: str, base: str, quote: str, days: list,
-                        notional: int, tolerance_bps: int, providers: list,
+                        notional: int, strike: int, tolerance_bps: int, providers: list,
                         settle_after: int, deadline: int) -> str:
+        """Escrow GEN, freeze the window, the pair, the strike and the sources."""
         buyer = self._addr_hex(gl.message.sender_address)
         escrow = int(gl.message.value)
-        if not self._is_valid_address(seller) or self._addr_hex(seller).lower() == buyer.lower():
+        ok = isinstance(seller, str) and seller.startswith("0x") and len(seller) == 42
+        if ok:
+            try:
+                int(seller[2:], 16)
+            except ValueError:
+                ok = False
+        if not ok or self._addr_hex(seller).lower() == buyer.lower():
             raise gl.vm.UserError("Seller must be another 0x address")
         if escrow <= 0:
-            raise gl.vm.UserError("Escrow must be > 0")
+            raise gl.vm.UserError("Escrow must be > 0 wei")
         b = str(base).strip().upper()
         q = str(quote).strip().upper()
         if len(b) != 3 or len(q) != 3 or not b.isalpha() or not q.isalpha() or b == q:
-            raise gl.vm.UserError("Base and quote must differ and be 3 letters")
-        if not isinstance(days, list) or not days or len(days) > MAX_DAYS:
+            raise gl.vm.UserError("Base and quote must differ")
+        if not isinstance(days, list) or not days or len(days) > 5:
             raise gl.vm.UserError("Window must be 1..5 days")
         wdays = []
         for d in days:
             ds = str(d).strip()
-            if len(ds) != 10 or ds[4] != "-" or ds[7] != "-":
-                raise gl.vm.UserError("Days must be YYYY-MM-DD")
-            if ds in wdays:
-                raise gl.vm.UserError("Days must be distinct")
+            if len(ds) != 10 or ds[4] != "-" or ds[7] != "-" or ds in wdays:
+                raise gl.vm.UserError("Days must be distinct YYYY-MM-DD")
             wdays.append(ds)
-        if int(notional) <= 0:
-            raise gl.vm.UserError("Notional must be > 0")
-        if not 0 <= int(tolerance_bps) <= MAX_TOL:
+        wdays.sort()
+        n = int(notional)
+        if n <= 0:
+            raise gl.vm.UserError("Notional must be > 0 wei")
+        st = int(strike)
+        # A mis-scaled strike is the classic unit bug: 6.72 not 672000000.
+        if st < 10 ** 4 or st > 10 ** 12:
+            raise gl.vm.UserError("Strike must be a rate at 1e8, 0.0001..10000")
+        if not 0 <= int(tolerance_bps) <= 5000:
             raise gl.vm.UserError("Tolerance must be 0..5000 bps")
-        if not isinstance(providers, list) or len(providers) < MIN_PROVIDERS:
+        if not isinstance(providers, list) or len(providers) < 2:
             raise gl.vm.UserError("Need at least two providers")
         plist = []
         for p in providers:
             pid = str(p).strip()
-            if pid not in PROVIDERS or pid in plist:
+            if pid not in ("frankfurter", "ecb", "currencyapi") or pid in plist:
                 raise gl.vm.UserError("Providers must be distinct and known")
             plist.append(pid)
         now = self._now()
         if int(settle_after) <= 0 or int(deadline) <= int(settle_after):
-            raise gl.vm.UserError("Deadline must follow the settle window")
-        # The window has to have ended for its average to exist at all, and a
-        # date the parser cannot read is not a date at all.
+            raise gl.vm.UserError("Deadline must follow settle_after")
+        # An average cannot exist before the window ends.
         for d in wdays:
-            end = self._day_end(d)
+            end = self._iso_to_epoch(d + "T23:59:59+00:00")
             if end <= 0 or end >= now:
                 raise gl.vm.UserError("Every window day must be real and past")
 
         did = "d" + str(int(self.deal_count))
         self.deals[did] = json.dumps({
             "deal_id": did, "buyer": buyer, "seller": self._addr_hex(seller),
-            "base": b, "quote": q, "days": wdays, "notional": int(notional),
-            "escrow": escrow, "tolerance_bps": int(tolerance_bps), "providers": plist,
+            "base": b, "quote": q, "days": wdays,
+            "notional": n, "escrow": escrow, "strike": st,
+            "tolerance_bps": int(tolerance_bps), "providers": plist,
             "settle_after": now + int(settle_after), "deadline": now + int(deadline),
-            "status": OPEN, "reason": "", "average": 0, "cost": 0,
-            "seller_paid": 0, "buyer_refund": 0, "valid_count": 0, "spread_bps": 0,
+            "status": OPEN, "reason": "",
+            "average": 0, "payout": 0, "seller_paid": 0, "buyer_refund": 0,
+            "valid_count": 0, "spread_bps": 0,
+            "units": {"asset": "GEN", "amount_decimals": 18,
+                      "rate_decimals": 8, "rate": "quote per base"},
         })
         self.deal_count = u256(int(self.deal_count) + 1)
         return did
 
     @gl.public.write
     def settle(self, deal_id: str) -> str:
-        """Average each provider over the closed window and pay at the middle one."""
+        """Average each provider over the closed window and pay the ratio."""
         d = self._load(deal_id)
         if str(d["status"]) != OPEN:
             raise gl.vm.UserError("Settlement is " + str(d["status"]))
@@ -283,9 +333,10 @@ class PeriodRateEscrow(gl.Contract):
             raise gl.vm.UserError("Settle window has closed")
         days = [str(x) for x in d["days"]]
         b, q = str(d["base"]), str(d["quote"])
+        need = len(days)
         first, last = days[0], days[-1]
+        notional, strike = int(d["notional"]), int(d["strike"])
 
-        # URL building is pure; the fetches happen inside run() below.
         urls = []
         for pid in d["providers"]:
             if pid == "frankfurter":
@@ -306,14 +357,13 @@ class PeriodRateEscrow(gl.Contract):
                                  "&format=csvdata"))
 
         def run() -> dict:
-            ev, snippet = {}, []
+            ev = {}
             for tag, kind, day, url in urls:
                 body = ""
                 try:
                     body = self._body(gl.nondet.web.get(url))
                 except Exception:
                     body = ""
-                snippet.append(body[:300])
                 if kind == "range":
                     ev[tag] = self._p_frankfurter(body, days, b, q)
                 elif kind == "day":
@@ -327,54 +377,36 @@ class PeriodRateEscrow(gl.Contract):
             rows = []
             for pid in d["providers"]:
                 got = ev.get(pid, {})
+                # A provider counts only when it covers the exact window asked
+                # for: a 2-of-3 average is not the period average.
                 rows.append({"provider": pid, "days": len(got),
+                             "covered": len(got) == need,
                              "average": (sum(got.values()) // len(got)) if got else 0})
 
-            good = [r for r in rows if r["days"] > 0 and r["average"] > 0]
-            out = rows
-            if len(good) < MIN_PROVIDERS:
-                return {"rows": out, "valid": len(good), "spread_bps": 0,
-                        "average": 0, "verdict": "UNVERIFIED"}
+            good = [r for r in rows if r["covered"] and r["average"] > 0]
+            out = {"rows": rows, "valid": len(good), "spread_bps": 0,
+                   "average": 0, "payout": 0, "verdict": "UNVERIFIED"}
+            if len(good) < 2:
+                return out
 
             avgs = sorted([int(r["average"]) for r in good])
             mid = len(avgs) // 2
             average = avgs[mid] if len(avgs) % 2 else (avgs[mid - 1] + avgs[mid]) // 2
             spread_bps = ((avgs[-1] - avgs[0]) * 10000) // average if average else 0
+            out["valid"] = len(good)
+            out["spread_bps"] = spread_bps
+            out["average"] = average
+            out["payout"] = self._payout(notional, average, strike)
+            out["verdict"] = ("DISAGREED" if spread_bps > int(d["tolerance_bps"])
+                              else "VERIFIED")
+            return out
 
-            if spread_bps > int(d["tolerance_bps"]):
-                verdict = "DISAGREED"
-            else:
-                verdict = "VERIFIED"
-            return {"rows": out, "valid": len(good), "spread_bps": spread_bps,
-                    "average": average, "verdict": verdict}
+        tol = self._agree_tol(int(d["tolerance_bps"]))
 
-        # One equivalence block per settlement; the average is compared within a
-        # tolerance because a live feed moves between two fetches.
         def agrees(leader) -> bool:
             if not isinstance(leader, gl.vm.Return):
                 return False
-            his = leader.calldata
-            mine = run()
-            if not isinstance(his, dict):
-                return False
-            for k in ("verdict", "valid"):
-                if str(his.get(k)) != str(mine.get(k)):
-                    return False
-            ha, ma = int(his.get("average", 0)), int(mine.get("average", 0))
-            if ha <= 0 or ma <= 0:
-                if ha != ma:
-                    return False
-            elif abs(ha - ma) * 10000 > ha * REF_TOL:
-                return False
-            hr, mr = his.get("rows"), mine.get("rows")
-            if not isinstance(hr, list) or not isinstance(mr, list) or len(hr) != len(mr):
-                return False
-            for x, y in zip(hr, mr):
-                if str(x.get("provider")) != str(y.get("provider")):
-                    return False
-                if bool(int(x.get("days", 0)) > 0) != bool(int(y.get("days", 0)) > 0):
-                    return False
-            return True
+            return self._agree(leader.calldata, run(), tol, len(d["providers"]))
 
         res = gl.vm.run_nondet_unsafe(run, agrees)
         if not isinstance(res, dict):
@@ -385,29 +417,34 @@ class PeriodRateEscrow(gl.Contract):
         d["valid_count"] = int(res.get("valid", 0))
         d["spread_bps"] = int(res.get("spread_bps", 0))
         d["average"] = int(res.get("average", 0))
-        escrow, notional = int(d["escrow"]), int(d["notional"])
+        d["payout"] = int(res.get("payout", 0))
         verdict = str(res.get("verdict", ""))
+        escrow = int(d["escrow"])
 
         if verdict != "VERIFIED":
             d["status"] = REFUNDED
             d["reason"] = ("providers did not agree" if verdict == "DISAGREED"
                            else "the period average could not be verified")
         else:
-            cost = (notional * d["average"]) // SCALE
-            if cost > escrow:
+            payout = int(d["payout"])
+            if payout <= 0:
                 d["status"] = REFUNDED
-                d["reason"] = "escrow does not cover the settled cost"
+                d["reason"] = "the payout came out at zero"
+            elif payout > escrow:
+                d["status"] = REFUNDED
+                d["reason"] = "the settled payout exceeds the escrow"
             else:
                 d["status"] = EXECUTED
                 d["reason"] = "settled at the period average"
-                d["cost"] = cost
-                d["seller_paid"] = cost
-                d["buyer_refund"] = escrow - cost
+                d["payout"] = payout
+                d["seller_paid"] = payout
+                d["buyer_refund"] = escrow - payout
                 self._save(d)
-                self._transfer(Address(d["seller"]), cost)
-                self._transfer(Address(d["buyer"]), escrow - cost)
+                self._transfer(Address(d["seller"]), payout)
+                self._transfer(Address(d["buyer"]), escrow - payout)
                 return EXECUTED
 
+        d["payout"] = 0
         d["seller_paid"] = 0
         d["buyer_refund"] = escrow
         self._save(d)
